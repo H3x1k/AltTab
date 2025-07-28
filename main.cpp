@@ -1,16 +1,204 @@
 #define UNICODE
 #define _UNICODE
+#define _WIN32_WINNT 0x0600
 #include <windows.h>
 #include <tchar.h>
+#include <psapi.h>
+#include <shellapi.h>
+#include <string>
 #include <iostream>
+#include <vector>
+
+// DWM cloak attribute constant
+#ifndef DWMWA_CLOAKED
+#define DWMWA_CLOAKED 14
+#endif
+
+// DWM cloak states
+#ifndef DWM_CLOAKED_APP
+#define DWM_CLOAKED_APP 0x0000001
+#endif
+#ifndef DWM_CLOAKED_SHELL
+#define DWM_CLOAKED_SHELL 0x0000002
+#endif
+#ifndef DWM_CLOAKED_INHERITED
+#define DWM_CLOAKED_INHERITED 0x0000004
+#endif
+
+
+
+#if !defined(__MINGW32__) || defined(__MINGW64_VERSION_MAJOR)
+// Already declared in MinGW-w64
+#else
+extern "C" BOOL WINAPI QueryFullProcessImageNameW(
+    HANDLE hProcess,
+    DWORD dwFlags,
+    LPWSTR lpExeName,
+    PDWORD lpdwSize
+);
+#endif
+
 
 HHOOK hHook = NULL;
 HWND hwndOverlay = NULL;
 bool isOverlayVisible = false;
 
+int screenWidth = GetSystemMetrics(SM_CXSCREEN);
+int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+
+int windowWidth = 600;
+int windowHeight = 300;
+
+int windowX = (screenWidth - windowWidth) / 2;
+int windowY = (screenHeight - windowHeight) / 2;
+
+struct AltTabWindow {
+    HWND hwnd;                 // Window handle — to interact with the window
+    std::wstring title;        // Window title text (shown in the Alt+Tab menu)
+    std::wstring exeName;      // Executable name (e.g., "notepad.exe"), useful for icons or grouping
+    HICON icon;                // Window or program icon (for display)
+    DWORD processId;           // Process ID, can be useful for filtering or grouping
+};
+
+std::vector<AltTabWindow> altTabWindows;
+
+
 // Forward declaration
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+typedef HRESULT(WINAPI* PFNDwmGetWindowAttribute)(HWND hwnd, DWORD dwAttribute, PVOID pvAttribute, DWORD cbAttribute);
+
+
+HICON GetProgramIcon(HWND hwnd) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == 0) return NULL;
+
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProcess) return NULL;
+
+    wchar_t exePath[MAX_PATH];
+    DWORD size = MAX_PATH;
+
+    if (!QueryFullProcessImageNameW(hProcess, 0, exePath, &size)) {
+        CloseHandle(hProcess);
+        return NULL;
+    }
+    CloseHandle(hProcess);
+
+    // Extract the first icon from the exe file
+    HICON hIcon = NULL;
+    UINT iconsExtracted = ExtractIconExW(exePath, 0, NULL, &hIcon, 1);
+    if (iconsExtracted == 0) return NULL;
+
+    return hIcon; // Caller must destroy with DestroyIcon(hIcon)
+}
+
+std::wstring GetProgramName(HWND hwnd) {
+    DWORD pid;
+    GetWindowThreadProcessId(hwnd, &pid);
+
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (!hProcess) return L"";
+
+    wchar_t path[MAX_PATH];
+    DWORD size = MAX_PATH;
+    if (QueryFullProcessImageNameW(hProcess, 0, path, &size)) {
+        CloseHandle(hProcess);
+        return std::wstring(path);
+    }
+
+    CloseHandle(hProcess);
+    return L"";
+}
+
+std::wstring GetWindowTitle(HWND hwnd) {
+    wchar_t title[256];
+    GetWindowTextW(hwnd, title, sizeof(title) / sizeof(wchar_t));
+    return std::wstring(title);
+}
+
+
+bool IsWindowCloaked(HWND hwnd) {
+    static PFNDwmGetWindowAttribute pDwmGetWindowAttribute = nullptr;
+
+    if (!pDwmGetWindowAttribute) {
+        HMODULE hDwmApi = LoadLibraryW(L"dwmapi.dll");
+        if (!hDwmApi) return false;
+        pDwmGetWindowAttribute = (PFNDwmGetWindowAttribute)GetProcAddress(hDwmApi, "DwmGetWindowAttribute");
+        if (!pDwmGetWindowAttribute) return false;
+    }
+
+    DWORD cloaked = 0;
+    HRESULT hr = pDwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+    if (SUCCEEDED(hr) && cloaked != 0) {
+        return true;
+    }
+    return false;
+}
+
+bool IsAltTabWindow(HWND hwnd) {
+    if (!IsWindowVisible(hwnd))
+        return false;
+
+    if (IsWindowCloaked(hwnd))  // Skip cloaked windows
+        return false;
+
+    if (GetAncestor(hwnd, GA_ROOT) != hwnd)
+        return false;
+
+    if (GetWindow(hwnd, GW_OWNER) != NULL)
+        return false;
+
+    LONG exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
+    if (exStyle & WS_EX_TOOLWINDOW)
+        return false;
+
+    LONG style = GetWindowLong(hwnd, GWL_STYLE);
+    if (!(style & WS_CAPTION))
+        return false;
+
+    if (GetWindowTextLengthW(hwnd) == 0)
+        return false;
+
+    RECT rc;
+    if (!GetWindowRect(hwnd, &rc))
+        return false;
+    if ((rc.right - rc.left) == 0 || (rc.bottom - rc.top) == 0)
+        return false;
+
+    return true;
+}
+
+BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
+    
+    if (IsAltTabWindow(hwnd)) {
+
+        AltTabWindow window;
+
+        window.hwnd = hwnd;
+        window.title = GetWindowTitle(hwnd);
+
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        window.processId = pid;
+
+        std::wstring exePath = GetProgramName(hwnd);
+        std::wstring exeName = exePath.substr(exePath.find_last_of(L"\\") + 1);
+        if (exeName.size() > 4 && exeName.substr(exeName.size() - 4) == L".exe") {
+            exeName = exeName.substr(0, exeName.size() - 4);
+        }
+        window.exeName = exeName;
+
+        window.icon = GetProgramIcon(hwnd);
+
+        altTabWindows.push_back(window);
+    } 
+    
+    return TRUE;
+}
+
 
 // Entry point
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
@@ -32,11 +220,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         CLASS_NAME,
         L"",
         WS_POPUP,
-        400, 200, 600, 200,
+        windowX, windowY, 
+        windowWidth, windowHeight,
         NULL, NULL, hInstance, NULL
     );
 
-    SetLayeredWindowAttributes(hwndOverlay, 0, 230, LWA_ALPHA); // 0 = color key (unused), alpha 0–255
+    SetLayeredWindowAttributes(hwndOverlay, 0, 255, LWA_ALPHA); // 0 = color key (unused), alpha 0–255
 
     // Install low-level keyboard hook
     hHook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyboardProc, NULL, 0);
@@ -78,7 +267,11 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         if (wParam == WM_SYSKEYDOWN || wParam == WM_KEYDOWN) {
             if (kbd->vkCode == VK_TAB && isAltDown) {
                 if (!isOverlayVisible) {
+                    altTabWindows.clear();
+                    EnumWindows(EnumWindowsProc, 0);
+
                     ShowWindow(hwndOverlay, SW_SHOW);
+                    InvalidateRect(hwndOverlay, NULL, TRUE);
                     isOverlayVisible = true;
                 }
                 return 1; // Block default Alt+Tab
@@ -101,7 +294,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         RECT rect;
         GetClientRect(hwnd, &rect);
         SetBkMode(hdc, TRANSPARENT);
-        DrawText(hdc, L"Custom Alt+Tab Menu", -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+        int lineHeight = 20;
+        int y = 20;
+
+        for (const auto& window: altTabWindows) {
+            RECT lineRect = { 10, y, rect.right - 10, y + lineHeight };
+            std::wstring text = window.exeName + L" | " + window.title;
+            DrawText(hdc, text.c_str(), -1, &lineRect, DT_LEFT | DT_TOP | DT_SINGLELINE);
+            y += lineHeight;
+        }
+
+        windowHeight = y;
+        windowY = (screenHeight - windowHeight) / 2;
+        SetWindowPos(hwnd, HWND_TOP, windowX, windowY, windowWidth, windowHeight, SWP_NOZORDER | SWP_NOACTIVATE);
+
         EndPaint(hwnd, &ps);
         break;
     }
