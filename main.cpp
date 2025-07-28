@@ -58,6 +58,7 @@ struct AltTabWindow {
     std::wstring exeName;      // Executable name (e.g., "notepad.exe"), useful for icons or grouping
     HICON icon;                // Window or program icon (for display)
     DWORD processId;           // Process ID, can be useful for filtering or grouping
+    char key;
 };
 
 std::vector<AltTabWindow> altTabWindows;
@@ -171,6 +172,36 @@ bool IsAltTabWindow(HWND hwnd) {
     return true;
 }
 
+bool FocusWindow(HWND hwnd) {
+    // Restore if minimized
+    if (IsIconic(hwnd))
+        ShowWindow(hwnd, SW_RESTORE);
+    else
+        ShowWindow(hwnd, SW_SHOW);
+
+    // Try to set foreground directly
+    if (SetForegroundWindow(hwnd))
+        return true;
+
+    // Fallback: force it by attaching threads
+    DWORD currentThreadId = GetCurrentThreadId();
+    DWORD targetThreadId = GetWindowThreadProcessId(hwnd, nullptr);
+
+    // Attach input queues
+    AttachThreadInput(currentThreadId, targetThreadId, TRUE);
+
+    // Bring to foreground
+    BringWindowToTop(hwnd); // Moves to top of Z-order
+    SetForegroundWindow(hwnd);
+    SetFocus(hwnd);
+    SetActiveWindow(hwnd);
+
+    // Detach input queues
+    AttachThreadInput(currentThreadId, targetThreadId, FALSE);
+
+    return true;
+}
+
 BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
     
     if (IsAltTabWindow(hwnd)) {
@@ -178,6 +209,7 @@ BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
         AltTabWindow window;
 
         window.hwnd = hwnd;
+
         window.title = GetWindowTitle(hwnd);
 
         DWORD pid = 0;
@@ -192,6 +224,8 @@ BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
         window.exeName = exeName;
 
         window.icon = GetProgramIcon(hwnd);
+
+        window.key = std::tolower(exeName[0]);
 
         altTabWindows.push_back(window);
     } 
@@ -279,6 +313,16 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
             if (kbd->vkCode == VK_ESCAPE) {
                 PostQuitMessage(0);
             }
+            if (isAltDown && isOverlayVisible) {
+                for (const auto& window: altTabWindows) {
+                    if (GetAsyncKeyState(std::toupper(window.key)) & 0x8000) {
+                        FocusWindow(window.hwnd);
+
+                        ShowWindow(hwndOverlay, SW_HIDE);
+                        isOverlayVisible = false;
+                    }
+                }
+            }
         }
     }
 
@@ -296,11 +340,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         SetBkMode(hdc, TRANSPARENT);
 
         int lineHeight = 20;
-        int y = 20;
+        int y = 10; // header height
 
         for (const auto& window: altTabWindows) {
             RECT lineRect = { 10, y, rect.right - 10, y + lineHeight };
-            std::wstring text = window.exeName + L" | " + window.title;
+            std::wstring text = std::wstring(1, std::toupper(window.key)) + L" | " + window.exeName + L" | " + window.title;
             DrawText(hdc, text.c_str(), -1, &lineRect, DT_LEFT | DT_TOP | DT_SINGLELINE);
             y += lineHeight;
         }
