@@ -173,6 +173,7 @@ bool IsAltTabWindow(HWND hwnd) {
 }
 
 bool FocusWindow(HWND hwnd) {
+
     // Restore if minimized
     if (IsIconic(hwnd))
         ShowWindow(hwnd, SW_RESTORE);
@@ -190,16 +191,16 @@ bool FocusWindow(HWND hwnd) {
     // Attach input queues
     AttachThreadInput(currentThreadId, targetThreadId, TRUE);
 
-    // Bring to foreground
-    BringWindowToTop(hwnd); // Moves to top of Z-order
-    SetForegroundWindow(hwnd);
-    SetFocus(hwnd);
-    SetActiveWindow(hwnd);
+    // Set all focus-related states
+    BringWindowToTop(hwnd);           // Bring to top of Z-order
+    SetForegroundWindow(hwnd);        // Set as foreground window
+    SetFocus(hwnd);                   // Set keyboard focus
+    SetActiveWindow(hwnd);            // Set active window
 
     // Detach input queues
     AttachThreadInput(currentThreadId, targetThreadId, FALSE);
 
-    return true;
+    return GetForegroundWindow() == hwnd;
 }
 
 BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
@@ -298,6 +299,17 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
             isOverlayVisible = false;
         }
 
+        if (isAltDown && isOverlayVisible) {
+            for (const auto& window: altTabWindows) {
+                if (GetAsyncKeyState(std::toupper(window.key)) & 0x8000) {
+                    FocusWindow(window.hwnd);
+
+                    ShowWindow(hwndOverlay, SW_HIDE);
+                    isOverlayVisible = false;
+                }
+            }
+        }
+
         if (wParam == WM_SYSKEYDOWN || wParam == WM_KEYDOWN) {
             if (kbd->vkCode == VK_TAB && isAltDown) {
                 if (!isOverlayVisible) {
@@ -312,16 +324,6 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
             }
             if (kbd->vkCode == VK_ESCAPE) {
                 PostQuitMessage(0);
-            }
-            if (isAltDown && isOverlayVisible) {
-                for (const auto& window: altTabWindows) {
-                    if (GetAsyncKeyState(std::toupper(window.key)) & 0x8000) {
-                        FocusWindow(window.hwnd);
-
-                        ShowWindow(hwndOverlay, SW_HIDE);
-                        isOverlayVisible = false;
-                    }
-                }
             }
         }
     }
